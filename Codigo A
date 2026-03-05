@@ -2,12 +2,13 @@
 
 struct Button {
   const uint8_t PIN;
-  uint32_t numberKeyPresses;
-  bool pressed;
+  volatile uint32_t numberKeyPresses; // ¡Añadido volatile!
+  volatile bool pressed;              // ¡Añadido volatile!
 };
 
 // Se define el botón en el pin 18
 Button button1 = {18, 0, false};
+bool isDetached = false; // Bandera para controlar la desconexión
 
 // Rutina de Servicio de Interrupción (ISR)
 void IRAM_ATTR isr() {
@@ -18,8 +19,12 @@ void IRAM_ATTR isr() {
 void setup() {
   Serial.begin(115200);
   pinMode(button1.PIN, INPUT_PULLUP);
+  
   // Se adjunta la interrupción al pin, se llama a isr() cuando el voltaje cae (FALLING)
   attachInterrupt(button1.PIN, isr, FALLING);
+  
+  // Añadido \n para que el texto salga en su propia línea
+  Serial.printf("Inicio de procesador\n"); 
 }
 
 void loop() {
@@ -31,9 +36,11 @@ void loop() {
 
   // Desconectar la interrupción después de 1 minuto (60000 ms)
   static uint32_t lastMillis = 0;
-  if (millis() - lastMillis > 60000) {
-    lastMillis = millis();
+  
+  // Solo entra si NO se ha desconectado antes y ya pasó el tiempo
+  if (!isDetached && (millis() - lastMillis > 60000)) {
     detachInterrupt(button1.PIN);
     Serial.println("Interrupt Detached!");
+    isDetached = true; // Cambiamos la bandera para que no vuelva a entrar aquí
   }
 }
