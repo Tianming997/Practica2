@@ -1,0 +1,177 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ==========================================
+// 1. CONFIGURACIÓN DE RED (Punto de Acceso)
+// ==========================================
+const char* ssid = "ESP32_Frecuencia"; // Nombre de la red Wi-Fi
+const char* password = "password123";  // Contraseña (mínimo 8 caracteres)
+WebServer server(80);
+
+// ==========================================
+// 2. CONFIGURACIÓN DEL BUFFER CIRCULAR
+// ==========================================
+#define QUEUE_SIZE 20
+volatile uint32_t pulseTimes[QUEUE_SIZE]; // Almacena el tiempo entre pulsos (en microsegundos)
+volatile uint8_t queueIndex = 0;
+volatile uint32_t lastTick = 0;
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED; // Para proteger la lectura de datos
+
+// ==========================================
+// 3. CONFIGURACIÓN DE HARDWARE (Timer e INT)
+// ==========================================
+const uint8_t SIGNAL_PIN = 18;
+hw_timer_t* timer = NULL;
+
+// Rutina de interrupción: Se dispara en cada flanco de subida
+void IRAM_ATTR isr_pulse() {
+  portENTER_CRITICAL_ISR(&mux);
+  
+  uint32_t currentTick = timerRead(timer); // Leemos el temporizador (en microsegundos)
+  uint32_t diff = currentTick - lastTick;  // Calculamos el periodo del pulso
+  
+  // Guardamos en la cola circular
+  if (diff > 0) {
+    pulseTimes[queueIndex] = diff;
+    queueIndex = (queueIndex + 1) % QUEUE_SIZE; // Vuelve a 0 si llega al final
+  }
+  
+  lastTick = currentTick;
+  
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+// ==========================================
+// 4. PÁGINA WEB (HTML + JavaScript)
+// ==========================================
+// Usamos R"rawliteral(...)rawliteral" para escribir HTML cómodamente en C++
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Monitor de Frecuencia ESP32</title>
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; background-color: #f4f4f9; color: #333; margin-top: 50px; }
+    .card { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); display: inline-block; width: 300px; margin: 10px; }
+    h1 { color: #007BFF; }
+    .value { font-size: 2em; font-weight: bold; color: #E03A3E; }
+  </style>
+</head>
+<body>
+  <h1>Monitor Dinámico de Señal</h1>
+  
+  <div class="card">
+    <h2>Frecuencia Media</h2>
+    <div class="value" id="avgFreq">-- Hz</div>
+  </div>
+  <div class="card">
+    <h2>Frecuencia Máxima</h2>
+    <div class="value" id="maxFreq">-- Hz</div>
+  </div>
+  <div class="card">
+    <h2>Frecuencia Mínima</h2>
+    <div class="value" id="minFreq">-- Hz</div>
+  </div>
+
+  <script>
+    // Esta función pide los datos al ESP32 cada segundo en segundo plano (AJAX/Fetch)
+    setInterval(function() {
+      fetch('/data')
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById('avgFreq').innerText = data.avg + " Hz";
+          document.getElementById('maxFreq').innerText = data.max + " Hz";
+          document.getElementById('minFreq').innerText = data.min + " Hz";
+        });
+    }, 1000); // 1000 ms = 1 segundo
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ==========================================
+// 5. MANEJADORES DEL SERVIDOR WEB
+// ==========================================
+
+// Sirve la página web principal
+void handleRoot() {
+  server.send(200, "text/html", index_html);
+}
+
+// Envía los datos calculados en formato JSON
+void handleData() {
+  uint32_t timesCopy[QUEUE_SIZE];
+  
+  // Copiamos la cola rápidamente bloqueando interrupciones para evitar datos corruptos
+  portENTER_CRITICAL(&mux);
+  for(int i = 0; i < QUEUE_SIZE; i++) {
+    timesCopy[i] = pulseTimes[i];
+  }
+  portEXIT_CRITICAL(&mux);
+
+  float minFreq = 999999.0, maxFreq = 0.0, sumFreq = 0.0;
+  int validReadings = 0;
+
+  // Calculamos frecuencias (f = 1 / T). El tiempo está en microsegundos, por lo que multiplicamos por 1 millón.
+  for(int i = 0; i < QUEUE_SIZE; i++) {
+    if(timesCopy[i] > 0) { // Ignoramos los valores 0 iniciales
+      float freq = 1000000.0 / (float)timesCopy[i];
+      if(freq < minFreq) minFreq = freq;
+      if(freq > maxFreq) maxFreq = freq;
+      sumFreq += freq;
+      validReadings++;
+    }
+  }
+
+  float avgFreq = 0.0;
+  if(validReadings > 0) {
+    avgFreq = sumFreq / validReadings;
+  } else {
+    minFreq = 0.0; // Si no hay lecturas, mostramos 0
+  }
+
+  // Preparamos la respuesta en JSON
+  String json = "{";
+  json += "\"avg\":\"" + String(avgFreq, 2) + "\",";
+  json += "\"max\":\"" + String(maxFreq, 2) + "\",";
+  json += "\"min\":\"" + String(minFreq, 2) + "\"";
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+// ==========================================
+// SETUP Y LOOP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+
+  // 1. Iniciar Timer (Temporizador 0, divisor 80 para contar en microsegundos)
+  timer = timerBegin(0, 80, true);
+  
+  // 2. Iniciar Pin e Interrupción
+  pinMode(SIGNAL_PIN, INPUT_PULLDOWN); // Usamos pulldown por si conectas un cable suelto
+  attachInterrupt(SIGNAL_PIN, isr_pulse, RISING);
+
+  // 3. Iniciar Punto de Acceso Wi-Fi
+  Serial.println("Iniciando Punto de Acceso...");
+  WiFi.softAP(ssid, password);
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("Red creada. Conéctate a la red Wi-Fi: ");
+  Serial.println(ssid);
+  Serial.print("Abre esta dirección IP en el navegador: http://");
+  Serial.println(IP);
+
+  // 4. Configurar Servidor Web
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+  Serial.println("Servidor HTTP iniciado.");
+}
+
+void loop() {
+  // El loop solo se encarga de mantener el servidor web vivo
+  server.handleClient();
+}
